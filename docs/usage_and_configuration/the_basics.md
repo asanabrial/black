@@ -525,7 +525,9 @@ You can also explicitly specify the path to a particular file that you want with
 
 If you're running with `--verbose`, you will see a message if a file was found and used.
 
-Please note `blackd` will not use `pyproject.toml` configuration.
+Please note `blackd` will not use the `[tool.black]` section. It reads its own server
+options from a `[tool.blackd]` section instead, see
+[Black as a server](./black_as_a_server.md#configuration).
 
 ### Configuration format
 

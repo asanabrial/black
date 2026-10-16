@@ -3,7 +3,9 @@ import gc
 import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Event
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -465,3 +467,116 @@ class BlackDClientTestCase(AioHTTPTestCase):
         with_syntax_error = "def hello(): a 'Hello, World!'"
         with self.assertRaises(black.InvalidInput):
             _ = await client.format_code(with_syntax_error)
+
+
+BLACKD_CONFIG = """\
+[tool.black]
+line-length = 100
+
+[tool.blackd]
+bind-host = "0.0.0.0"
+bind-port = 9090
+cors-allow-origin = ["https://example.com", "https://example.org"]
+max-body-size = 1024
+"""
+
+
+@pytest.mark.blackd
+class TestBlackDConfiguration:
+    def invoke_main(self, args: list[str]) -> tuple[dict[str, Any], dict[str, Any]]:
+        with (
+            patch("blackd.web.run_app") as run_app,
+            patch("blackd.make_app", wraps=blackd.make_app) as make_app,
+        ):
+            result = CliRunner().invoke(blackd.main, args)
+            if result.exception is not None:
+                raise result.exception
+            assert result.exit_code == 0, result.output
+        return dict(run_app.call_args.kwargs), dict(make_app.call_args.kwargs)
+
+    def test_parse_pyproject_toml(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "pyproject.toml"
+        config_file.write_text(BLACKD_CONFIG, encoding="utf-8")
+        assert blackd.parse_pyproject_toml(str(config_file)) == {
+            "bind_host": "0.0.0.0",
+            "bind_port": 9090,
+            "cors_allow_origin": ["https://example.com", "https://example.org"],
+            "max_body_size": 1024,
+        }
+
+    def test_options_from_config_file(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "pyproject.toml"
+        config_file.write_text(BLACKD_CONFIG, encoding="utf-8")
+        run_app_kwargs, make_app_kwargs = self.invoke_main(
+            ["--config", str(config_file)]
+        )
+        assert run_app_kwargs["host"] == "0.0.0.0"
+        assert run_app_kwargs["port"] == 9090
+        assert make_app_kwargs == {
+            "cors_allow_origins": ("https://example.com", "https://example.org"),
+            "max_body_size": 1024,
+        }
+
+    def test_command_line_overrides_config_file(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "pyproject.toml"
+        config_file.write_text(BLACKD_CONFIG, encoding="utf-8")
+        run_app_kwargs, make_app_kwargs = self.invoke_main([
+            "--config",
+            str(config_file),
+            "--bind-port",
+            "1234",
+            "--cors-allow-origin",
+            "https://example.net",
+        ])
+        assert run_app_kwargs["host"] == "0.0.0.0"
+        assert run_app_kwargs["port"] == 1234
+        assert make_app_kwargs == {
+            "cors_allow_origins": ("https://example.net",),
+            "max_body_size": 1024,
+        }
+
+    def test_config_file_discovered_from_working_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "pyproject.toml").write_text(BLACKD_CONFIG, encoding="utf-8")
+        subdirectory = tmp_path / "src"
+        subdirectory.mkdir()
+        monkeypatch.chdir(subdirectory)
+        run_app_kwargs, _ = self.invoke_main([])
+        assert run_app_kwargs["host"] == "0.0.0.0"
+        assert run_app_kwargs["port"] == 9090
+
+    def test_defaults_without_blackd_section(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "pyproject.toml").write_text(
+            "[tool.black]\nline-length = 100\n", encoding="utf-8"
+        )
+        monkeypatch.chdir(tmp_path)
+        run_app_kwargs, make_app_kwargs = self.invoke_main([])
+        assert run_app_kwargs["host"] == "localhost"
+        assert run_app_kwargs["port"] == 45484
+        assert make_app_kwargs == {
+            "cors_allow_origins": (),
+            "max_body_size": blackd.DEFAULT_MAX_BODY_SIZE,
+        }
+
+    def test_cors_allow_origin_must_be_a_list(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "pyproject.toml"
+        config_file.write_text(
+            '[tool.blackd]\ncors-allow-origin = "https://example.com"\n',
+            encoding="utf-8",
+        )
+        result = CliRunner().invoke(blackd.main, ["--config", str(config_file)])
+        assert result.exit_code == 2
+        assert "Config key cors-allow-origin must be a list" in result.output
+
+    def test_invalid_config_key_is_reported(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "pyproject.toml"
+        config_file.write_text("[tool.blackd]\nbind-prot = 9090\n", encoding="utf-8")
+        with patch("blackd.web.run_app"):
+            result = CliRunner().invoke(blackd.main, ["--config", str(config_file)])
+        assert result.exit_code == 0
+        assert "Invalid config keys detected: 'bind_prot'" in result.output

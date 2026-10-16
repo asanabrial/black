@@ -5,6 +5,7 @@ from concurrent.futures import Executor, ProcessPoolExecutor
 from datetime import datetime, timezone
 from functools import cache, partial
 from multiprocessing import freeze_support
+from typing import Any
 
 try:
     from aiohttp import web
@@ -23,6 +24,7 @@ import click
 import black
 from _black_version import version as __version__
 from black.concurrency import maybe_use_uvloop
+from black.files import _load_toml, find_pyproject_toml
 
 # This is used internally by tests to shut down the server prematurely
 _stop_signal = asyncio.Event()
@@ -68,7 +70,93 @@ class InvalidVariantHeader(Exception):
     pass
 
 
+def parse_pyproject_toml(path_config: str) -> dict[str, Any]:
+    """Parse a pyproject toml file, pulling out the `[tool.blackd]` section.
+
+    Keys are normalized the same way as for Black's own `[tool.black]` section.
+    If parsing fails, will raise a tomllib.TOMLDecodeError.
+    """
+    pyproject_toml = _load_toml(path_config)
+    config: dict[str, Any] = pyproject_toml.get("tool", {}).get("blackd", {})
+    return {k.replace("--", "").replace("-", "_"): v for k, v in config.items()}
+
+
+def read_pyproject_toml(
+    ctx: click.Context, param: click.Parameter | None, value: str | None
+) -> str | None:
+    """Inject blackd configuration from "pyproject.toml" into defaults in `ctx`.
+
+    The file is looked up the same way Black looks up its own configuration,
+    starting from the current working directory.
+
+    Returns the path to a successfully found and read configuration file, None
+    otherwise.
+    """
+    if not value:
+        value = find_pyproject_toml((), None)
+        if value is None:
+            return None
+
+    try:
+        config = parse_pyproject_toml(value)
+    except (OSError, ValueError) as e:
+        raise click.FileError(
+            filename=value, hint=f"Error reading configuration file: {e}"
+        ) from None
+
+    if not config:
+        return None
+
+    # Config keys are the long option names, which do not always match the name of
+    # the parameter (e.g. --cors-allow-origin is stored in cors_allow_origins).
+    option_to_param = {
+        opt[2:].replace("-", "_"): p.name
+        for p in ctx.command.params
+        for opt in p.opts
+        if opt.startswith("--") and p.name is not None
+    }
+    config = {option_to_param.get(k, k): v for k, v in config.items()}
+    black.spellcheck_pyproject_toml_keys(ctx, list(config), value)
+
+    cors_allow_origins = config.get("cors_allow_origins")
+    if cors_allow_origins is not None and not isinstance(cors_allow_origins, list):
+        raise click.BadOptionUsage(
+            "cors-allow-origin", "Config key cors-allow-origin must be a list"
+        )
+
+    # Sanitize the values to be Click friendly, like Black does.
+    config = {
+        k: str(v) if not isinstance(v, (list, dict)) else v for k, v in config.items()
+    }
+
+    default_map: dict[str, Any] = {}
+    if ctx.default_map:
+        default_map.update(ctx.default_map)
+    default_map.update(config)
+
+    ctx.default_map = default_map
+    return value
+
+
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.option(
+    "--config",
+    type=click.Path(
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        allow_dash=False,
+        path_type=str,
+    ),
+    is_eager=True,
+    callback=read_pyproject_toml,
+    help=(
+        "Read configuration options from a configuration file. By default the"
+        " [tool.blackd] section of the pyproject.toml found the same way as Black's"
+        " configuration is used."
+    ),
+)
 @click.option(
     "--bind-host",
     type=str,
@@ -94,12 +182,15 @@ class InvalidVariantHeader(Exception):
 )
 @click.version_option(version=black.__version__)
 def main(
+    config: str | None,
     bind_host: str,
     bind_port: int,
     cors_allow_origins: tuple[str, ...],
     max_body_size: int,
 ) -> None:
     logging.basicConfig(level=logging.INFO)
+    if config:
+        black.out(f"Using configuration from {config}.")
     app = make_app(cors_allow_origins=cors_allow_origins, max_body_size=max_body_size)
     ver = black.__version__
     black.out(f"blackd version {ver} listening on {bind_host} port {bind_port}")

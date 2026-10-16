@@ -48,6 +48,9 @@
 
 <!-- Changes to Blackd -->
 
+- `blackd` can now read its options from a `[tool.blackd]` section in `pyproject.toml`
+  or from a file passed with the new `--config` option (#5548)
+
 ### Integrations
 
 <!-- For example, Docker, GitHub Actions, pre-commit, editors -->
